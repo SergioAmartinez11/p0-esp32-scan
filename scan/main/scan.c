@@ -17,12 +17,17 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
+#include "esp_system.h"
 #include <stdio.h>
 #include "freertos/task.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "sdkconfig.h"
 #include "utils.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "esp_mac.h"
+#include "esp_wifi.h"
 
 #define DEFAULT_SCAN_LIST_SIZE 5
 
@@ -35,10 +40,86 @@
 #define ECHO_UART_PORT_NUM (0)
 #define ECHO_UART_BAUD_RATE (115200)
 #define ECHO_TASK_STACK_SIZE (1024)
+#define EXAMPLE_ESP_WIFI_CHANNEL 8
+#define EXAMPLE_MAX_STA_CONN 4
 
 static const char *TAG = "P0";
+static char *wifi_ssid = "";
+static char *password = "";
 
 #define BUF_SIZE (1024)
+
+static void wifi_scan(void);
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_id == WIFI_EVENT_AP_STACONNECTED)
+    {
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+        ESP_LOGI(TAG, "station " MACSTR " join, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    }
+    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
+    {
+        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
+        ESP_LOGI(TAG, "station " MACSTR " leave, AID=%d",
+                 MAC2STR(event->mac), event->aid);
+    }
+}
+
+static void wifi_connect_task(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    while (1)
+    {
+
+        if (strcmp(wifi_ssid, "") && strcmp(password, ""))
+        {
+
+            ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                                ESP_EVENT_ANY_ID,
+                                                                &wifi_event_handler,
+                                                                NULL,
+                                                                NULL));
+            wifi_config_t wifi_config = {
+                .ap = {
+                    .ssid = wifi_ssid,
+                    .ssid_len = strlen(wifi_ssid),
+                    .channel = EXAMPLE_ESP_WIFI_CHANNEL,
+                    .password = password,
+                    .max_connection = EXAMPLE_MAX_STA_CONN,
+                    .authmode = WIFI_AUTH_WPA_WPA2_PSK},
+            };
+
+            ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+            ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+            ESP_ERROR_CHECK(esp_wifi_start());
+
+            ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
+                     wifi_ssid, password, EXAMPLE_ESP_WIFI_CHANNEL);
+
+            password = "";
+            wifi_ssid = "";
+        }
+    }
+}
+
+void esp_help_log()
+{
+    ESP_LOGW(TAG, "Format: [-command] [network] [password]");
+    ESP_LOGW(TAG, "Example: -i uabc secret1234");
+    ESP_LOGW(TAG, "Command list: [-i, -x, -h] [-I, -X, -H]");
+    ESP_LOGW(TAG, "-i: connect to network.");
+    ESP_LOGW(TAG, "-x: exit network.");
+    ESP_LOGW(TAG, "-h: help.");
+}
 
 static void echo_task(void *arg)
 {
@@ -67,65 +148,59 @@ static void echo_task(void *arg)
     // cadena donde se almacena cada palabra
     char str_mem[50];
     uint8_t index = 0;
-    uint8_t stringLen = 0;
-    
+    int stringLen = 0;
 
-    ESP_LOGW(TAG, "Format: [-command] [network] [password]");
-    ESP_LOGW(TAG, "Ie: -i uabc secret1234");
-    ESP_LOGW(TAG, "Command list: [-i, -x, -h] [-I, -X, -H]");
-    ESP_LOGW(TAG, "-i: connect to network.");
-    ESP_LOGW(TAG, "-x: exit network.");
-    ESP_LOGW(TAG, "-h: help.");
     char **arrayString;
     while (1)
     {
         // Read data from the UART
         int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, (BUF_SIZE - 1), 20 / portTICK_PERIOD_MS);
-        // logica para manejar entrada de datos
-
         if (len)
         {
-            // si hay enter en la cadena
+
             str_mem[index] = data[0];
             index++;
             if (str_mem[index - 1] == 13)
             {
-                // data[len] = '\0';
-                
+
                 str_mem[index] = '\0';
                 index = 0;
                 arrayString = trimString(str_mem, &stringLen);
-                ESP_LOGI(TAG, "%s %s %s", arrayString[0], arrayString[1], arrayString[2]);
-                if (strcmp((char *)arrayString[0],"-i") || strcmp((char *)arrayString[0],"-I"))
+                if (stringLen >= 1)
                 {
-                    // arrayString[1] -> network; arrayString[2] -> password
-                    free(arrayString[0]);
-                }
-                else if (strcmp(arrayString[0],"-x") || strcmp(arrayString[0],"-X"))
-                {
-                    // turn off actual network
-                    ESP_LOGI(TAG, "Input: %s %s %s", arrayString[0], arrayString[1], arrayString[2]);
-                    free(arrayString[0]);
-                    free(arrayString[1]);
-                    free(arrayString[2]);
-                }
-                else if (strcmp((char *)arrayString[0],"-h") || strcmp((char *)arrayString[0],"-H"))
-                {
-                    ESP_LOGW(TAG, "Format: [-command] [network] [password]");
-                    ESP_LOGW(TAG, "Ie: -i uabc secret1234");
-                    ESP_LOGW(TAG, "Command list: [-i, -x, -h] [-I, -X, -H]");
-                    ESP_LOGW(TAG, "-i: connect to network.");
-                    ESP_LOGW(TAG, "-x: exit network.");
-                    ESP_LOGW(TAG, "-h: help.");
-                    free(arrayString[0]);
-                }else{
-                    ESP_LOGI(TAG, "ELSE DEFAULT");
-                    free(arrayString[0]);
-                    free(arrayString[1]);
-                    free(arrayString[2]);
-                }
 
-                free(arrayString);
+                    if (!strcmp(arrayString[0], "-i") || (!strcmp(arrayString[0], "-I") && stringLen > 2))
+                    {
+
+                        ESP_LOGI(TAG, "Connecting... %s", arrayString[1]);
+                    }
+                    if (!strcmp(arrayString[0], "-x") || !strcmp(arrayString[0], "-X"))
+                    {
+                        // turn off actual network
+                        ESP_LOGI(TAG, "Exiting");
+                    }
+                    if (!strcmp(arrayString[0], "-s") || !strcmp(arrayString[0], "-S"))
+                    {
+                        // scan networks
+                        ESP_LOGI(TAG, "Scanning");
+                        wifi_scan();
+                    }
+                    if (!strcmp(arrayString[0], "-h") || !strcmp(arrayString[0], "-H"))
+                    {
+                        esp_help_log();
+                    }
+
+                    // free(arrayString[0]);
+                    // free(arrayString[1]);
+                    // free(arrayString[2]);
+                    free(arrayString);
+                }
+                else
+                {
+
+                    ESP_LOGE(TAG, "Invalid input. Please provide the right format. Write -h -H for help.");
+                    ESP_LOGW(TAG, "Format: [-command] [network] [password]");
+                }
             }
             if (index > 50)
             {
@@ -253,7 +328,7 @@ void delayMs(uint16_t ms)
 }
 
 /* Initialize Wi-Fi as sta and set scan method */
-static void wifi_scan(void)
+static void wifi_scan_setup(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -262,7 +337,6 @@ static void wifi_scan(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
     uint16_t number = DEFAULT_SCAN_LIST_SIZE;
     wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];
     uint16_t ap_count = 0;
@@ -287,10 +361,6 @@ static void wifi_scan(void)
     }
 }
 
-static void connect_to_wifi()
-{
-}
-
 void app_main(void)
 {
     // Initialize NVS
@@ -303,6 +373,9 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     // crea la tarea para manejar inputs del usuario en el uart 0
+
     xTaskCreate(echo_task, "uart_echo_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
-    wifi_scan();
+    xTaskCreate(wifi_connect_task, "wifi_connect_task", ECHO_TASK_STACK_SIZE, NULL, 10, NULL);
+    wifi_scan_setup();
+    esp_help_log();
 }
